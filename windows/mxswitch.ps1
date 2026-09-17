@@ -49,7 +49,7 @@ using Microsoft.Win32.SafeHandles;
 using System.IO;
 using System.Threading.Tasks;
 
-public class Hid {
+public class MxHid {
     const int  DIGCF_PRESENT = 0x02, DIGCF_DEVICEINTERFACE = 0x10;
     const uint GENERIC_READ = 0x80000000, GENERIC_WRITE = 0x40000000;
     const uint FILE_SHARE_RW = 0x03, OPEN_EXISTING = 3, FILE_FLAG_OVERLAPPED = 0x40000000;
@@ -96,6 +96,9 @@ public class Hid {
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
     static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr tmpl);
 
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool CancelIoEx(SafeFileHandle h, IntPtr overlapped);
+
     public class Iface {
         public string Path, Product;
         public ushort UsagePage, Usage, Pid, InLen, OutLen;
@@ -129,7 +132,8 @@ public class Hid {
                     int ok = HidP_GetCaps(pp, ref caps);
                     HidD_FreePreparsedData(pp);
                     if (ok != HIDP_STATUS_SUCCESS) continue;
-                    if (caps.UsagePage < 0xFF00) continue;   // vendor collections only
+                    // Include non-vendor collections too: on Bluetooth, HID++ sometimes
+                    // lives outside 0xFF00 (same as the macOS/Python ports).
                     if (caps.OutputLen == 0) continue;       // cannot send anything here
 
                     var name = new char[128];
@@ -145,17 +149,18 @@ public class Hid {
     }
 
     FileStream stream;
+    SafeFileHandle handle;
     int inLen, outLen;
     public int OutLen { get { return outLen; } }
 
-    public Hid(Iface iface) {
-        var h = CreateFileW(iface.Path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_RW,
-                            IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero);
-        if (h.IsInvalid) throw new IOException("cannot open " + iface.Path);
+    public MxHid(Iface iface) {
+        handle = CreateFileW(iface.Path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_RW,
+                             IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, IntPtr.Zero);
+        if (handle.IsInvalid) throw new IOException("cannot open " + iface.Path);
         inLen = iface.InLen; outLen = iface.OutLen;
         // bufferSize 1 disables FileStream's internal buffering. Device I/O must
         // reach the driver as whole reports, never coalesced or split.
-        stream = new FileStream(h, FileAccess.ReadWrite, 1, true);
+        stream = new FileStream(handle, FileAccess.ReadWrite, 1, true);
     }
 
     /*
@@ -178,12 +183,18 @@ public class Hid {
     }
 
     // A synchronous read on a device with nothing to say never returns, so this
-    // races the read against a timer and abandons it on timeout.
+    // races the read against a timer. On timeout we MUST CancelIoEx — abandoning
+    // ReadAsync leaves a pending IRP that corrupts later probes on the same handle
+    // (a common reason the keyboard is listed but never matched for ChangeHost).
     public byte[] Read(int timeoutMs) {
         var buf = new byte[inLen];
         try {
             var task = stream.ReadAsync(buf, 0, inLen);
-            if (Task.WaitAny(new Task[] { task }, timeoutMs) != 0) return new byte[0];
+            if (Task.WaitAny(new Task[] { task }, timeoutMs) != 0) {
+                try { CancelIoEx(handle, IntPtr.Zero); } catch { }
+                try { task.Wait(100); } catch { }
+                return new byte[0];
+            }
             if (task.IsFaulted || task.Result <= 0) return new byte[0];
             var outb = new byte[task.Result];
             Array.Copy(buf, outb, task.Result);
@@ -237,26 +248,29 @@ function Invoke-HidppCall {
 $CacheFile = Join-Path $env:LOCALAPPDATA 'mxswitch\devices.json'
 
 function Get-DeviceRank {
-    param([int]$UsagePage, [int]$Usage, [string]$Product)
+    param([int]$UsagePage, [int]$Usage, [string]$Product, [int]$Pid = 0)
     $n = "$Product".ToLowerInvariant()
     $mouse = ($UsagePage -eq 0x0001 -and $Usage -eq 0x0002) -or
-             ($n -match 'master|anywhere|mouse|ergo')
+             ($n -match 'master|anywhere|mouse|ergo') -or
+             ($Pid -in 0xB034, 0xB035, 0xB023, 0xB019)
     $kbd = ($UsagePage -eq 0x0001 -and $Usage -eq 0x0006) -or
-           ($n -match 'keys|keyboard')
+           ($n -match 'keys|keyboard|mechanical') -or
+           ($Pid -in 0xB380, 0xB35B, 0xB35F, 0xB361, 0xB37C, 0xB36A)
     $tier = if ($kbd -and -not $mouse) { 2 } elseif ($mouse) { 0 } else { 1 }
     $nonVendor = if ($UsagePage -ge 0xFF00) { 0 } else { 1 }
     return (10 * $tier + $nonVendor)
 }
 
-# Sibling HID collections of one physical device share Product + Pid.
+# Sibling collections of one physical device share Pid; receivers share Pid
+# across device indices, so identity is Pid + HID++ device index.
 function Get-DeviceIdentity {
-    param($Iface)
-    return ('{0}|{1:x4}' -f $Iface.Product, $Iface.Pid)
+    param($Iface, [int]$DevIdx = 0xFF)
+    return ('{0:x4}|{1:x2}' -f $Iface.Pid, $DevIdx)
 }
 
 function New-IfaceFromCache {
     param($Entry)
-    $iface = New-Object 'Hid+Iface'
+    $iface = New-Object 'MxHid+Iface'
     $iface.Path = $Entry.Path; $iface.Product = $Entry.Product
     $iface.UsagePage = $Entry.UsagePage; $iface.Usage = $Entry.Usage
     $iface.Pid = $Entry.Pid
@@ -267,11 +281,11 @@ function New-IfaceFromCache {
 function Test-CachedEntry {
     param($Entry)
     $iface = New-IfaceFromCache $Entry
-    try { $dev = New-Object Hid $iface } catch { return $null }
+    try { $dev = New-Object MxHid $iface } catch { return $null }
 
-    $r = Invoke-HidppCall $dev 0x11 $Entry.DevIdx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250
+    $r = Invoke-HidppCall $dev 0x11 $Entry.DevIdx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 400
     if (-not $r) {
-        $r = Invoke-HidppCall $dev 0x10 $Entry.DevIdx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250
+        $r = Invoke-HidppCall $dev 0x10 $Entry.DevIdx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 400
     }
     if ($r -and $r[4] -eq $Entry.FeatureIdx -and $r[4] -ne 0) {
         Write-Verbose ("using cached device: {0}" -f $iface.Product)
@@ -312,30 +326,32 @@ function Save-CachedDevices {
                 DevIdx = $ctx.DevIdx; ReportId = $ctx.ReportId; FeatureIdx = $ctx.FeatureIdx
             }
         })
-        [pscustomobject]@{ Version = 2; Devices = $entries } |
+        [pscustomobject]@{ Version = 3; Devices = $entries } |
             ConvertTo-Json | Set-Content $CacheFile
     } catch {
         Write-Verbose 'could not write cache'
     }
 }
 
-function Test-ChangeHostMatch {
+function Find-ChangeHostOnIface {
     param($Dev, $Iface)
+    # Prefer the report ID whose frame size matches this collection.
     $reportIds = @(0x11, 0x10) | Sort-Object `
         @{ Expression = { if ($FRAME_LEN[[int]$_] -eq $Iface.OutLen) { 0 } else { 1 } } }
 
+    $matches = New-Object System.Collections.Generic.List[object]
     foreach ($didx in $DEVICE_INDICES) {
         foreach ($rid in $reportIds) {
-            $r = Invoke-HidppCall $Dev $rid $didx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250
+            $r = Invoke-HidppCall $Dev $rid $didx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 400
             if ($r -and $r[4] -ne 0) {
-                return [pscustomobject]@{
-                    Dev = $Dev; ReportId = $rid; DevIdx = $didx
-                    FeatureIdx = $r[4]; Iface = $Iface
-                }
+                $matches.Add([pscustomobject]@{
+                    ReportId = $rid; DevIdx = $didx; FeatureIdx = $r[4]; Iface = $Iface
+                })
+                break   # next device index; one report id is enough per index
             }
         }
     }
-    return $null
+    return @($matches)
 }
 
 function Find-MxDevices {
@@ -345,34 +361,51 @@ function Find-MxDevices {
     foreach ($entry in Get-CachedEntries) {
         $ctx = Test-CachedEntry $entry
         if (-not $ctx) { continue }
-        $id = Get-DeviceIdentity $ctx.Iface
+        $id = Get-DeviceIdentity $ctx.Iface $ctx.DevIdx
         if ($seen.ContainsKey($id)) { $ctx.Dev.Close(); continue }
         $seen[$id] = $true
         $found.Add($ctx)
     }
 
     # Higher rank first: keyboards before mice (hotkey can still reach the keyboard).
-    $ifaces = [Hid]::Enumerate($VID) |
-        Sort-Object { Get-DeviceRank $_.UsagePage $_.Usage $_.Product } -Descending
+    $ifaces = [MxHid]::Enumerate($VID) |
+        Sort-Object { Get-DeviceRank $_.UsagePage $_.Usage $_.Product $_.Pid } -Descending
 
     foreach ($iface in $ifaces) {
-        $id = Get-DeviceIdentity $iface
-        if ($seen.ContainsKey($id)) { continue }
+        Write-Verbose ("probing {0:x4}:{1:x4} pid={2:x4} out={3} {4}" -f `
+            $iface.UsagePage, $iface.Usage, $iface.Pid, $iface.OutLen, $iface.Product)
 
-        Write-Verbose ("probing {0:x4}:{1:x4} out={2} {3}" -f `
-            $iface.UsagePage, $iface.Usage, $iface.OutLen, $iface.Product)
+        try { $dev = New-Object MxHid $iface } catch { continue }
 
-        try { $dev = New-Object Hid $iface } catch { continue }
-
-        $ctx = Test-ChangeHostMatch $dev $iface
-        if ($ctx) {
-            Write-Verbose ("matched index=0x{0:x2} report=0x{1:x2} {2}" -f `
-                $ctx.DevIdx, $ctx.ReportId, $iface.Product)
-            $seen[$id] = $true
-            $found.Add($ctx)
-        } else {
+        $hits = Find-ChangeHostOnIface $dev $iface
+        if (-not $hits -or $hits.Count -eq 0) {
             $dev.Close()
+            continue
         }
+
+        # One open handle can serve multiple receiver device indices; clone by
+        # reopening for every match after the first so each context owns a handle.
+        $first = $true
+        foreach ($hit in $hits) {
+            $id = Get-DeviceIdentity $iface $hit.DevIdx
+            if ($seen.ContainsKey($id)) { continue }
+
+            if ($first) {
+                $openDev = $dev
+                $first = $false
+            } else {
+                try { $openDev = New-Object MxHid $iface } catch { continue }
+            }
+
+            Write-Verbose ("matched pid={0:x4} index=0x{1:x2} report=0x{2:x2} {3}" -f `
+                $iface.Pid, $hit.DevIdx, $hit.ReportId, $iface.Product)
+            $seen[$id] = $true
+            $found.Add([pscustomobject]@{
+                Dev = $openDev; ReportId = $hit.ReportId; DevIdx = $hit.DevIdx
+                FeatureIdx = $hit.FeatureIdx; Iface = $iface
+            })
+        }
+        if ($first) { $dev.Close() }  # all hits were already seen
     }
 
     if ($found.Count -gt 0) { Save-CachedDevices $found }
@@ -380,14 +413,14 @@ function Find-MxDevices {
     # Stable switch order: keyboards before mice, regardless of cache warmup order.
     return @(
         $found | Sort-Object {
-            - (Get-DeviceRank $_.Iface.UsagePage $_.Iface.Usage $_.Iface.Product)
+            - (Get-DeviceRank $_.Iface.UsagePage $_.Iface.Usage $_.Iface.Product $_.Iface.Pid)
         }
     )
 }
 
 if ($List) {
-    $found = [Hid]::Enumerate($VID)
-    if (-not $found) { 'No Logitech vendor HID collections found.'; exit 1 }
+    $found = [MxHid]::Enumerate($VID)
+    if (-not $found) { 'No Logitech HID collections with output reports found.'; exit 1 }
     'usagePage:usage   pid    in  out  product'
     $found | ForEach-Object {
         '   {0:x4}:{1:x4}     {2:x4}  {3,3} {4,4}  {5}' -f `
@@ -409,7 +442,7 @@ if ($Info) {
     foreach ($found in $devices) {
         if (-not $first) { '' }
         $first = $false
-        'device     : {0}' -f $found.Iface.Product
+        'device     : {0}  (pid={1:x4})' -f $found.Iface.Product, $found.Iface.Pid
         'collection : {0:x4}:{1:x4}  in={2} out={3}' -f `
             $found.Iface.UsagePage, $found.Iface.Usage, $found.Iface.InLen, $found.Iface.OutLen
         'transport  : {0}  index=0x{1:x2}  report=0x{2:x2}' -f `
@@ -426,49 +459,67 @@ if ($Info) {
 
 <#
     setCurrentHost never replies - the link is torn down as part of executing it.
-    That makes "did it work?" awkward: a write that returns cleanly proves only
-    that the driver accepted the buffer, not that the device acted on it. If the
-    process exits here, the handle closes and a report still in flight can be
-    lost, which is why a plain write-and-exit succeeds only intermittently.
-
-    So verify by absence. After the switch the device should stop answering; if
-    it still replies to getHostInfo, the frame did not land and we try again.
+    Probe handles may have pending I/O residue, so reopen each device, blast
+    ChangeHost to every matched device quickly (keyboard first), then ask
+    BetterDisplay to flip the monitor.
 #>
-function Invoke-Switch {
-    param($Ctx, [int]$TargetChannel, [int]$Attempts = 4)
+function Send-ChangeHost {
+    param($Ctx, [int]$TargetChannel, [int]$Attempts = 3)
 
     $frame = New-Object byte[] $FRAME_LEN[[int]$Ctx.ReportId]
     $frame[0] = $Ctx.ReportId; $frame[1] = $Ctx.DevIdx; $frame[2] = $Ctx.FeatureIdx
     $frame[3] = (1 -shl 4) -bor $SW_ID; $frame[4] = $TargetChannel - 1
 
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        Write-Verbose ("switch attempt {0} ({1})" -f $attempt, $Ctx.Iface.Product)
+        Write-Verbose ("switch attempt {0} ({1} pid={2:x4})" -f `
+            $attempt, $Ctx.Iface.Product, $Ctx.Iface.Pid)
         if ($Ctx.Dev.Write($frame)) {
-            Start-Sleep -Milliseconds 250
-            $still = Invoke-HidppCall $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx `
-                                      $Ctx.FeatureIdx 0 @() 250
-            if (-not $still) { return $true }        # gone: it worked
-            Write-Verbose 'device still responding, retrying'
+            Start-Sleep -Milliseconds 80
+            return $true
         }
-        Start-Sleep -Milliseconds 200
+        Start-Sleep -Milliseconds 100
     }
     return $false
 }
 
+# Reopen clean handles after discovery probes.
+$fresh = New-Object System.Collections.Generic.List[object]
+foreach ($found in $devices) {
+    $found.Dev.Close()
+    try {
+        $re = New-Object MxHid $found.Iface
+    } catch {
+        Write-Warning ("Could not reopen {0} (pid={1:x4})" -f `
+            $found.Iface.Product, $found.Iface.Pid)
+        continue
+    }
+    $fresh.Add([pscustomobject]@{
+        Dev = $re; ReportId = $found.ReportId; DevIdx = $found.DevIdx
+        FeatureIdx = $found.FeatureIdx; Iface = $found.Iface
+    })
+}
+$devices = @($fresh)
+
 $n = $devices.Count
+if ($n -eq 0) {
+    Write-Error 'Matched devices could not be reopened for switching.'
+    exit 1
+}
+
 "Switching $n device$(if ($n -eq 1) { '' } else { 's' }) to channel $FixedChannel ..."
 $okCount = 0
 foreach ($found in $devices) {
-    "  $($found.Iface.Product)"
-    if (Invoke-Switch $found $FixedChannel) { $okCount++ }
+    "  {0}  (pid={1:x4})" -f $found.Iface.Product, $found.Iface.Pid
+    if (Send-ChangeHost $found $FixedChannel) { $okCount++ }
     else {
-        Write-Warning ("{0} did not leave this host." -f $found.Iface.Product)
+        Write-Warning ("{0} (pid={1:x4}) did not accept ChangeHost." -f `
+            $found.Iface.Product, $found.Iface.Pid)
     }
     $found.Dev.Close()
 }
 if ($okCount -eq 0) {
-    Write-Error ('No device left this host. They may be asleep, or the target ' +
-                 'channel may be unpaired. Click a device and retry.')
+    Write-Error ('No device accepted the channel switch. They may be asleep, or the ' +
+                 'target channel may be unpaired. Press a key / click the mouse and retry.')
     exit 1
 }
 
