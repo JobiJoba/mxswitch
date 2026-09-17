@@ -2,10 +2,10 @@
 #SingleInstance Force
 
 ; ---------------------------------------------------------------------------
-; Edit this path to windows\mxswitch.ps1 (preferred) or python\mxswitch.py.
-; The PowerShell build always switches to channel 2; -Channel is ignored.
+; Prefer the Python port on Windows (more reliable HID I/O than the .ps1).
+; Edit SCRIPT to your real path. Python always switches to channel 2 + HDMI.
 ; ---------------------------------------------------------------------------
-SCRIPT := "C:\Path\To\mxswitch\windows\mxswitch.ps1"
+SCRIPT := "C:\Path\To\mxswitch\python\mxswitch.py"
 
 SwitchAway() {
     global SCRIPT
@@ -14,8 +14,8 @@ SwitchAway() {
             'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{1}"',
             SCRIPT), , "Hide")
     } else {
-        ; Python port still needs an explicit channel (2 = Mac on this setup).
-        Run(Format('pythonw.exe "{1}" 2', SCRIPT), , "Hide")
+        ; pythonw = no console flash. Channel arg is ignored on Windows.
+        Run(Format('pythonw.exe "{1}"', SCRIPT), , "Hide")
     }
 }
 

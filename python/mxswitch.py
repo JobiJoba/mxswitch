@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """
-mxswitch.py - switch a Logitech Easy-Switch device (MX Master 3S, MX Keys, ...)
+mxswitch.py - switch Logitech Easy-Switch devices (MX Master 3S, MX Keys, ...)
 to another channel via HID++ 2.0 feature 0x1814 (ChangeHost).
 
-On Windows this needs nothing but a Python 3 interpreter: the HID plumbing goes
-straight through hid.dll and setupapi.dll via ctypes. No admin rights - the
-vendor-defined collection is not the exclusively-claimed mouse collection.
+Switches every ChangeHost-capable device on this host (keyboard and mouse).
 
-On macOS/Linux it falls back to hidapi (pip install hidapi), since there is no
-equivalent always-present C API to lean on.
+On Windows this needs nothing but a Python 3 interpreter: the HID plumbing goes
+straight through hid.dll and setupapi.dll via ctypes. No admin rights. This
+Windows build always targets channel 2, then asks BetterDisplay on the Mac to
+select the HDMI input.
+
+On macOS/Linux it falls back to hidapi (pip install hidapi).
 
     python mxswitch.py --info        # show channels and which one is active
-    python mxswitch.py 2             # switch to channel 2
+    python mxswitch.py               # Windows: switch all to channel 2 + display
+    python mxswitch.py 2             # non-Windows: switch all to channel 2
     python mxswitch.py --list        # dump candidate HID interfaces
 
-Exit codes: 0 ok, 1 device not found, 2 bad usage.
+Exit codes: 0 ok, 1 device not found / switch failed, 2 bad usage.
 """
+
+from __future__ import annotations
 
 import argparse
 import sys
 import time
+import urllib.error
+import urllib.request
 
 LOGITECH_VID = 0x046D
 SW_ID = 0x0A                  # software id, any value 1..15
@@ -32,17 +39,29 @@ FRAME_LEN = {SHORT: 7, LONG: 20}
 # 0xFF for a directly-connected device (Bluetooth/USB), 1..6 via a receiver.
 DEVICE_INDICES = (0xFF, 1, 2, 3, 4, 5, 6)
 
+# Windows KVM defaults (same as windows/mxswitch.ps1).
+FIXED_CHANNEL_WIN = 2
+BETTERDISPLAY_URL = (
+    "http://192.168.129.25:55777/set?ddcAlt=144&vcp=inputSelectAlt"
+)
 
-def device_rank(usage_page, usage, name):
-    """Lower = try first. Mice before keyboards; vendor pages before others."""
+# Bluetooth PIDs when the product string is unhelpful.
+KNOWN_MICE = {0xB034, 0xB035, 0xB023, 0xB019}
+KNOWN_KBDS = {0xB380, 0xB35B, 0xB35F, 0xB361, 0xB37C, 0xB36A}
+
+
+def device_rank(usage_page, usage, name, product_id=0):
+    """Higher = try first. Keyboards before mice; vendor pages before others."""
     name = (name or "").lower()
     mouse = ((usage_page == 0x0001 and usage == 0x0002)
-             or any(w in name for w in ("master", "anywhere", "mouse", "ergo")))
+             or any(w in name for w in ("master", "anywhere", "mouse", "ergo"))
+             or product_id in KNOWN_MICE)
     kbd = ((usage_page == 0x0001 and usage == 0x0006)
-           or any(w in name for w in ("keys", "keyboard")))
+           or any(w in name for w in ("keys", "keyboard", "mechanical"))
+           or product_id in KNOWN_KBDS)
     tier = 2 if (kbd and not mouse) else (0 if mouse else 1)
     non_vendor = 0 if usage_page >= 0xFF00 else 1
-    return tier * 10 + non_vendor
+    return tier * 10 + (1 - non_vendor)
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +130,7 @@ if sys.platform == "win32":
                                      ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
                                      wintypes.HANDLE]
     kernel32.CreateEventW.restype = wintypes.HANDLE
+    kernel32.CancelIo.argtypes = [wintypes.HANDLE]
     hid_dll.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.POINTER(HIDP_CAPS)]
 
     def _query(path):
@@ -137,8 +157,9 @@ if sys.platform == "win32":
             finally:
                 hid_dll.HidD_FreePreparsedData(pp)
 
-            if caps.UsagePage < 0xFF00:
-                return None                # not a vendor-defined collection
+            # Include non-vendor collections: Bluetooth HID++ sometimes lives there.
+            if caps.OutputReportByteLength == 0:
+                return None
 
             name = ctypes.create_unicode_buffer(128)
             hid_dll.HidD_GetProductString(h, name, ctypes.sizeof(name))
@@ -175,13 +196,13 @@ if sys.platform == "win32":
                         found.append(info)
         finally:
             setupapi.SetupDiDestroyDeviceInfoList(hdev)
-        found.sort(key=lambda i: device_rank(i["usage_page"], i["usage"],
-                                             i["product_string"]))
+        found.sort(key=lambda i: -device_rank(i["usage_page"], i["usage"],
+                                              i["product_string"], i["product_id"]))
         yield from found
 
     class Device:
         """Overlapped I/O, because a blocking ReadFile on a HID device that has
-        nothing to say will simply never return."""
+        nothing to say will simply never return. Timeouts always CancelIo."""
 
         def __init__(self, info):
             self.in_len, self.out_len = info["in_len"], info["out_len"]
@@ -204,16 +225,18 @@ if sys.platform == "win32":
             return transferred.value
 
         def write(self, data):
+            """Return True if the driver accepted the frame."""
             buf = ctypes.create_string_buffer(
                 bytes(data).ljust(self.out_len, b"\x00"), self.out_len)
             ov = OVERLAPPED()
             ov.hEvent = self.event
             kernel32.ResetEvent(self.event)
             if not kernel32.WriteFile(self.h, buf, self.out_len, None, ctypes.byref(ov)):
-                if ctypes.get_last_error() != ERROR_IO_PENDING:
-                    raise OSError(ctypes.get_last_error(), "WriteFile failed")
-                if self._wait(ov, 1000) is None:
-                    raise OSError("write timed out")
+                err = ctypes.get_last_error()
+                if err != ERROR_IO_PENDING:
+                    return False
+                return self._wait(ov, 1000) is not None
+            return True
 
         def read(self, timeout_ms=100):
             buf = ctypes.create_string_buffer(self.in_len)
@@ -242,9 +265,6 @@ else:
         sys.exit("On this platform mxswitch needs hidapi:  pip install hidapi")
 
     def enumerate_interfaces():
-        # Prefer mice over keyboards when both are present. Prefer vendor-defined
-        # collections; also yield others — over Bluetooth on macOS, HID++ often
-        # lives on the mouse collection alone.
         seen = set()
         found = []
         for info in hid.enumerate(LOGITECH_VID, 0):
@@ -253,10 +273,10 @@ else:
             seen.add(info["path"])
             found.append({"path": info["path"], "usage_page": info["usage_page"],
                           "usage": info["usage"], "product_id": info["product_id"],
-                          "product_string": info["product_string"],
+                          "product_string": info["product_string"] or "",
                           "in_len": FRAME_LEN[LONG], "out_len": 0})
-        found.sort(key=lambda i: device_rank(i["usage_page"], i["usage"],
-                                             i["product_string"]))
+        found.sort(key=lambda i: -device_rank(i["usage_page"], i["usage"],
+                                              i["product_string"], i["product_id"]))
         yield from found
 
     class Device:
@@ -267,7 +287,11 @@ else:
             self.dev.set_nonblocking(0)
 
         def write(self, data):
-            self.dev.write(bytes(data))
+            try:
+                self.dev.write(bytes(data))
+                return True
+            except OSError:
+                return False
 
         def read(self, timeout_ms=100):
             return bytes(self.dev.read(FRAME_LEN[LONG], timeout_ms=timeout_ms))
@@ -283,7 +307,8 @@ else:
 def request(dev, report_id, dev_idx, feature_idx, function, params=b"", timeout_ms=500):
     """Send one HID++ call and wait for its matching reply. None on timeout/error."""
     frame = bytes([report_id, dev_idx, feature_idx, (function << 4) | SW_ID]) + params
-    dev.write(frame.ljust(FRAME_LEN[report_id], b"\x00"))
+    if not dev.write(frame.ljust(FRAME_LEN[report_id], b"\x00")):
+        return None
 
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
@@ -298,29 +323,55 @@ def request(dev, report_id, dev_idx, feature_idx, function, params=b"", timeout_
     return None
 
 
-def find_device():
-    """Return (dev, dev_idx, report_id, changehost_feature_idx, info) or None."""
+def find_devices():
+    """Return a list of dicts: dev, dev_idx, report_id, feat_idx, info.
+
+    One entry per physical Easy-Switch device (deduped by product_id + HID++
+    device index). Keyboards are listed before mice.
+    """
     probe = bytes([FEAT_CHANGE_HOST >> 8, FEAT_CHANGE_HOST & 0xFF, 0x00])
+    seen = set()
+    results = []
+
     for info in enumerate_interfaces():
         try:
-            dev = Device(info)
+            probe_dev = Device(info)
         except OSError:
             continue
-        # A collection only carries frames it has room for.
+
         report_ids = [r for r in (LONG, SHORT)
                       if not info["out_len"] or FRAME_LEN[r] <= info["out_len"]]
+        hits = []
         for dev_idx in DEVICE_INDICES:
+            ident = (info["product_id"], dev_idx)
+            if ident in seen:
+                continue
             for report_id in report_ids:
-                try:
-                    reply = request(dev, report_id, dev_idx, ROOT_FEATURE, 0,
-                                    probe, timeout_ms=250)
-                except OSError:
-                    continue
-                # reply[4] is the feature index; 0 means "not supported"
+                reply = request(probe_dev, report_id, dev_idx, ROOT_FEATURE, 0,
+                                probe, timeout_ms=400)
                 if reply and reply[4] != 0x00:
-                    return dev, dev_idx, report_id, reply[4], info
-        dev.close()
-    return None
+                    hits.append((dev_idx, report_id, reply[4]))
+                    break
+        probe_dev.close()
+
+        for dev_idx, report_id, feat_idx in hits:
+            ident = (info["product_id"], dev_idx)
+            if ident in seen:
+                continue
+            try:
+                dev = Device(info)
+            except OSError:
+                continue
+            seen.add(ident)
+            results.append({
+                "dev": dev,
+                "dev_idx": dev_idx,
+                "report_id": report_id,
+                "feat_idx": feat_idx,
+                "info": info,
+            })
+
+    return results
 
 
 def host_info(dev, dev_idx, report_id, feat_idx):
@@ -331,13 +382,29 @@ def host_info(dev, dev_idx, report_id, feat_idx):
 def set_host(dev, dev_idx, report_id, feat_idx, host_0based):
     """setCurrentHost. Never replies - the link is gone by then."""
     frame = bytes([report_id, dev_idx, feat_idx, (1 << 4) | SW_ID, host_0based])
-    dev.write(frame.ljust(FRAME_LEN[report_id], b"\x00"))
+    return bool(dev.write(frame.ljust(FRAME_LEN[report_id], b"\x00")))
+
+
+def switch_display_hdmi():
+    """Ask BetterDisplay on the Mac to select HDMI (Mac input)."""
+    try:
+        with urllib.request.urlopen(BETTERDISPLAY_URL, timeout=5) as resp:
+            ok = 200 <= getattr(resp, "status", 200) < 300
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        print(f"BetterDisplay switch failed: {exc}", file=sys.stderr)
+        return False
+    if not ok:
+        print("BetterDisplay switch failed (bad HTTP status).", file=sys.stderr)
+        return False
+    print(f"display    : HDMI (Mac) via {BETTERDISPLAY_URL}")
+    return True
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("channel", nargs="?", type=int, help="target channel, 1-based")
+    ap.add_argument("channel", nargs="?", type=int,
+                    help="target channel, 1-based (ignored on Windows; always 2)")
     ap.add_argument("--info", action="store_true", help="show host info and exit")
     ap.add_argument("--list", action="store_true", help="dump HID interfaces and exit")
     args = ap.parse_args()
@@ -348,31 +415,68 @@ def main():
                   f"  out={i['out_len']}  {i['product_string']}")
         return 0
 
-    if not args.info and args.channel is None:
-        ap.error("give a channel number, or --info")
-    if args.channel is not None and not 1 <= args.channel <= 3:
-        ap.error("channel must be 1, 2 or 3")
+    is_win = sys.platform == "win32"
+    if is_win:
+        channel = FIXED_CHANNEL_WIN
+    else:
+        if not args.info and args.channel is None:
+            ap.error("give a channel number, or --info")
+        channel = args.channel
+        if channel is not None and not 1 <= channel <= 3:
+            ap.error("channel must be 1, 2 or 3")
 
-    found = find_device()
-    if not found:
+    devices = find_devices()
+    if not devices:
         print("No Logitech device supporting ChangeHost found.", file=sys.stderr)
-        print("Click the mouse once to wake it, then retry. See also --list.",
-              file=sys.stderr)
+        print("Press a key / click the mouse to wake devices, then retry. "
+              "See also --list.", file=sys.stderr)
         return 1
-    dev, dev_idx, report_id, feat_idx, info = found
 
     if args.info:
-        print(f"device     : {info['product_string']}")
-        print(f"transport  : {'direct (BT/USB)' if dev_idx == 0xFF else 'receiver'}"
-              f"  index={dev_idx:#04x}  report={report_id:#04x}")
-        print(f"ChangeHost : feature index {feat_idx:#04x}")
-        hosts = host_info(dev, dev_idx, report_id, feat_idx)
-        if hosts:
-            print(f"channels   : {hosts[0]}, currently on {hosts[1] + 1}")
+        for i, d in enumerate(devices):
+            if i:
+                print()
+            info = d["info"]
+            print(f"device     : {info['product_string']}  "
+                  f"(pid={info['product_id']:#06x})")
+            print(f"transport  : "
+                  f"{'direct (BT/USB)' if d['dev_idx'] == 0xFF else 'receiver'}"
+                  f"  index={d['dev_idx']:#04x}  report={d['report_id']:#04x}")
+            print(f"ChangeHost : feature index {d['feat_idx']:#04x}")
+            hosts = host_info(d["dev"], d["dev_idx"], d["report_id"], d["feat_idx"])
+            if hosts:
+                print(f"channels   : {hosts[0]}, currently on {hosts[1] + 1}")
+            d["dev"].close()
         return 0
 
-    print(f"Switching to channel {args.channel} ...")
-    set_host(dev, dev_idx, report_id, feat_idx, args.channel - 1)
+    n = len(devices)
+    print(f"Switching {n} device{'s' if n != 1 else ''} to channel {channel} ...")
+    ok = 0
+    for d in devices:
+        info = d["info"]
+        print(f"  {info['product_string']}  (pid={info['product_id']:#06x})")
+        # A couple of quick writes; setCurrentHost never replies.
+        landed = False
+        for _ in range(3):
+            if set_host(d["dev"], d["dev_idx"], d["report_id"], d["feat_idx"],
+                        channel - 1):
+                landed = True
+                time.sleep(0.08)
+                break
+            time.sleep(0.1)
+        if landed:
+            ok += 1
+        else:
+            print(f"  ! {info['product_string']} did not accept ChangeHost",
+                  file=sys.stderr)
+        d["dev"].close()
+
+    if ok == 0:
+        print("No device accepted the channel switch.", file=sys.stderr)
+        return 1
+
+    if is_win and not switch_display_hdmi():
+        return 1
     return 0
 
 
