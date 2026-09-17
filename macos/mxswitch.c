@@ -1,6 +1,10 @@
 /*
- * mxswitch.c - switch a Logitech Easy-Switch device to another channel via
+ * mxswitch.c - switch Logitech Easy-Switch devices to another channel via
  *              HID++ 2.0 feature 0x1814 (ChangeHost). macOS, no dependencies.
+ *
+ * Switches every ChangeHost-capable device on this host (keyboard and mouse)
+ * to channel 1 (this Mac build is fixed to hand devices to that channel).
+ * On success it also asks BetterDisplay to select the USB-C input (Windows).
  *
  * Build:
  *     clang -O2 -Wall -o mxswitch mxswitch.c \
@@ -8,12 +12,13 @@
  *     codesign -s - mxswitch          # ad-hoc sign: keeps the TCC grant stable
  *
  * Usage:
+ *     ./mxswitch              # switch all devices to channel 1 + USB-C display
  *     ./mxswitch --info
- *     ./mxswitch 2
- *     ./mxswitch --setup              # open Input Monitoring settings if needed
+ *     ./mxswitch --setup      # open Input Monitoring settings if needed
  *
  * Needs Input Monitoring (System Settings > Privacy & Security). Grant it to
  * this binary, and to whatever launches it (BetterTouchTool, Raycast, ...).
+ * BetterDisplay must be running with HTTP integration on port 55777.
  */
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -31,6 +36,11 @@
 #define SW_ID             0x0A
 #define ROOT_FEATURE      0x00
 #define FEAT_CHANGE_HOST  0x1814
+#define FIXED_CHANNEL     1     /* this Mac build always switches to channel 1 */
+
+/* BetterDisplay HTTP API: USB-C / Windows input (ddcAlt from server/config.json). */
+#define BETTERDISPLAY_USBC_URL \
+    "http://127.0.0.1:55777/set?ddcAlt=465&vcp=inputSelectAlt"
 
 #define REPORT_SHORT 0x10
 #define REPORT_LONG  0x11
@@ -127,26 +137,29 @@ static int hidpp_call(IOHIDDeviceRef dev, uint8_t report_id, uint8_t dev_idx,
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    IOHIDManagerRef mgr;     /* kept alive while dev is open */
     IOHIDDeviceRef dev;
+    uint8_t rxbuf[64];       /* must live while the input callback is registered */
     uint8_t dev_idx, report_id, feature_idx;
+    int32_t location_id;     /* groups HID collections of one physical device */
     char name[128];
 } target_t;
 
-static void target_release(target_t *t) {
-    if (t->dev) {
-        IOHIDDeviceUnscheduleFromRunLoop(t->dev, CFRunLoopGetCurrent(),
-                                         kCFRunLoopDefaultMode);
-        IOHIDDeviceClose(t->dev, kIOHIDOptionsTypeNone);
-        t->dev = NULL;
+static void targets_release(target_t *targets, int n, IOHIDManagerRef mgr) {
+    if (targets) {
+        for (int i = 0; i < n; i++) {
+            if (!targets[i].dev) continue;
+            IOHIDDeviceUnscheduleFromRunLoop(targets[i].dev, CFRunLoopGetCurrent(),
+                                             kCFRunLoopDefaultMode);
+            IOHIDDeviceClose(targets[i].dev, kIOHIDOptionsTypeNone);
+            targets[i].dev = NULL;
+        }
+        free(targets);
     }
-    if (t->mgr) {
-        CFRelease(t->mgr);
-        t->mgr = NULL;
-    }
+    if (mgr) CFRelease(mgr);
 }
 
-/* Lower rank = try first. Mice before keyboards; vendor pages before others. */
+/* Higher rank = probe first. Keyboards before mice so a hotkey-triggered
+ * switch can still reach the keyboard while it is on this host. */
 static int name_has(const char *name, const char *needle) {
     return name && strcasestr(name, needle) != NULL;
 }
@@ -164,17 +177,39 @@ static int device_rank(int32_t usage_page, int32_t usage, const char *name) {
 
 typedef struct {
     IOHIDDeviceRef dev;
-    int32_t usage_page, usage, max_in;
+    int32_t usage_page, usage, max_in, location_id;
     int rank;
     char name[128];
 } cand_t;
 
 static int cand_cmp(const void *a, const void *b) {
-    return ((const cand_t *)a)->rank - ((const cand_t *)b)->rank;
+    /* Descending: keyboards (higher rank) before mice. */
+    return ((const cand_t *)b)->rank - ((const cand_t *)a)->rank;
 }
 
-static int find_device(target_t *t, int list_only) {
-    memset(t, 0, sizeof(*t));
+static int already_have_device(const target_t *targets, int n,
+                              int32_t location_id, const char *name) {
+    for (int i = 0; i < n; i++) {
+        if (location_id != 0 && targets[i].location_id == location_id)
+            return 1;
+        /* Location unavailable: treat identical product strings as one device
+         * so we do not send ChangeHost twice via sibling collections. */
+        if (location_id == 0 && targets[i].location_id == 0
+            && strcmp(targets[i].name, name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * Find every Logitech HID collection that speaks ChangeHost, one entry per
+ * physical device. Caller owns *out_targets / *out_mgr via targets_release.
+ * Returns the count (0 on failure / none). list_only prints and returns 0.
+ */
+static int find_devices(target_t **out_targets, IOHIDManagerRef *out_mgr,
+                        int list_only) {
+    *out_targets = NULL;
+    *out_mgr = NULL;
 
     IOHIDManagerRef mgr = IOHIDManagerCreate(kCFAllocatorDefault,
                                              kIOHIDOptionsTypeNone);
@@ -214,6 +249,7 @@ static int find_device(target_t *t, int list_only) {
         cands[ncand].usage_page = usage_page;
         cands[ncand].usage = usage;
         cands[ncand].max_in = max_in;
+        cands[ncand].location_id = prop_int(d, CFSTR(kIOHIDLocationIDKey));
         cands[ncand].rank = device_rank(usage_page, usage, name);
         snprintf(cands[ncand].name, sizeof(cands[ncand].name), "%s", name);
         ncand++;
@@ -230,40 +266,47 @@ static int find_device(target_t *t, int list_only) {
 
     qsort(cands, (size_t)ncand, sizeof(cand_t), cand_cmp);
 
+    target_t *targets = calloc((size_t)ncand, sizeof(target_t));
+    int nfound = 0;
     const uint8_t probe[3] = { FEAT_CHANGE_HOST >> 8, FEAT_CHANGE_HOST & 0xFF, 0 };
-    int found = 0;
 
-    for (CFIndex i = 0; i < ncand && !found; i++) {
+    for (CFIndex i = 0; i < ncand; i++) {
+        if (already_have_device(targets, nfound, cands[i].location_id,
+                                cands[i].name))
+            continue;
+
         IOHIDDeviceRef d = cands[i].dev;
         int32_t max_in = cands[i].max_in;
 
         if (IOHIDDeviceOpen(d, kIOHIDOptionsTypeNone) != kIOReturnSuccess)
             continue;
 
-        static uint8_t rxbuf[64];
-        IOHIDDeviceRegisterInputReportCallback(d, rxbuf, max_in, input_cb, NULL);
+        target_t *t = &targets[nfound];
+        IOHIDDeviceRegisterInputReportCallback(d, t->rxbuf, max_in, input_cb, NULL);
         IOHIDDeviceScheduleWithRunLoop(d, CFRunLoopGetCurrent(),
                                        kCFRunLoopDefaultMode);
 
         uint8_t reply[64];
         const uint8_t rids[2] = { REPORT_LONG, REPORT_SHORT };
-        for (size_t a = 0; a < sizeof(DEVICE_INDICES) && !found; a++) {
-            for (size_t b = 0; b < 2 && !found; b++) {
+        int matched = 0;
+        for (size_t a = 0; a < sizeof(DEVICE_INDICES) && !matched; a++) {
+            for (size_t b = 0; b < 2 && !matched; b++) {
                 if (!hidpp_call(d, rids[b], DEVICE_INDICES[a], ROOT_FEATURE, 0,
                                 probe, 3, reply, 0.25))
                     continue;
                 if (reply[4] == 0) continue;     /* feature not supported */
-                t->mgr = mgr;
                 t->dev = d;
                 t->dev_idx = DEVICE_INDICES[a];
                 t->report_id = rids[b];
                 t->feature_idx = reply[4];
+                t->location_id = cands[i].location_id;
                 snprintf(t->name, sizeof(t->name), "%s", cands[i].name);
-                found = 1;
+                matched = 1;
+                nfound++;
             }
         }
 
-        if (!found) {
+        if (!matched) {
             IOHIDDeviceUnscheduleFromRunLoop(d, CFRunLoopGetCurrent(),
                                              kCFRunLoopDefaultMode);
             IOHIDDeviceClose(d, kIOHIDOptionsTypeNone);
@@ -271,8 +314,16 @@ static int find_device(target_t *t, int list_only) {
     }
 
     free(cands);
-    if (!found) CFRelease(mgr);
-    return found;
+
+    if (nfound == 0) {
+        free(targets);
+        CFRelease(mgr);
+        return 0;
+    }
+
+    *out_targets = targets;
+    *out_mgr = mgr;
+    return nfound;
 }
 
 /* ------------------------------------------------------------------ */
@@ -368,57 +419,98 @@ static int setup_input_monitoring(void) {
     return 0;
 }
 
+/* Ask BetterDisplay to select the USB-C (Windows) input. Returns 1 on success. */
+static int switch_display_usbc(void) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "/usr/bin/curl -fsS --max-time 5 '%s' >/dev/null",
+             BETTERDISPLAY_USBC_URL);
+    int rc = system(cmd);
+    if (rc != 0) {
+        fprintf(stderr, "BetterDisplay USB-C switch failed (is BetterDisplay "
+                        "running with HTTP on :55777?)\n");
+        return 0;
+    }
+    printf("display    : USB-C (Windows)\n");
+    return 1;
+}
+
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s {1|2|3|--info|--list|--setup}\n", argv[0]);
+    if (argc > 2) {
+        fprintf(stderr, "usage: %s [--info|--list|--setup]\n", argv[0]);
         return 2;
     }
 
-    if (strcmp(argv[1], "--setup") == 0)
+    const char *mode = (argc == 2) ? argv[1] : NULL;
+
+    if (mode && strcmp(mode, "--setup") == 0)
         return setup_input_monitoring();
 
-    if (strcmp(argv[1], "--list") == 0) {
-        target_t t;
-        find_device(&t, 1);
+    if (mode && strcmp(mode, "--list") == 0) {
+        target_t *targets = NULL;
+        IOHIDManagerRef mgr = NULL;
+        find_devices(&targets, &mgr, 1);
         return 0;
     }
 
-    int want_info = strcmp(argv[1], "--info") == 0;
-    int channel = 0;
-    if (!want_info) {
-        channel = atoi(argv[1]);
-        if (channel < 1 || channel > 3) {
-            fprintf(stderr, "channel must be 1, 2 or 3\n");
-            return 2;
-        }
+    int want_info = mode && strcmp(mode, "--info") == 0;
+    /* A bare channel number is accepted for older callers but ignored. */
+    if (mode && !want_info && mode[0] == '-') {
+        fprintf(stderr, "usage: %s [--info|--list|--setup]\n", argv[0]);
+        return 2;
     }
 
-    target_t t;
-    if (!find_device(&t, 0)) {
+    target_t *targets = NULL;
+    IOHIDManagerRef mgr = NULL;
+    int n = find_devices(&targets, &mgr, 0);
+    if (n == 0) {
         fprintf(stderr, "No Logitech device supporting ChangeHost found.\n");
         fprintf(stderr, "Click the mouse to wake it, and check Input Monitoring.\n");
         return 1;
     }
 
     if (want_info) {
-        uint8_t reply[64];
-        printf("device     : %s\n", t.name);
-        printf("transport  : %s  index=0x%02x  report=0x%02x\n",
-               t.dev_idx == 0xFF ? "direct (BT/USB)" : "receiver",
-               t.dev_idx, t.report_id);
-        printf("ChangeHost : feature index 0x%02x\n", t.feature_idx);
-        if (hidpp_call(t.dev, t.report_id, t.dev_idx, t.feature_idx, 0,
-                       NULL, 0, reply, 0.4))
-            printf("channels   : %d, currently on %d\n", reply[4], reply[5] + 1);
-        target_release(&t);
+        for (int i = 0; i < n; i++) {
+            target_t *t = &targets[i];
+            uint8_t reply[64];
+            if (i > 0) printf("\n");
+            printf("device     : %s\n", t->name);
+            printf("transport  : %s  index=0x%02x  report=0x%02x\n",
+                   t->dev_idx == 0xFF ? "direct (BT/USB)" : "receiver",
+                   t->dev_idx, t->report_id);
+            printf("ChangeHost : feature index 0x%02x\n", t->feature_idx);
+            if (hidpp_call(t->dev, t->report_id, t->dev_idx, t->feature_idx, 0,
+                           NULL, 0, reply, 0.4))
+                printf("channels   : %d, currently on %d\n",
+                       reply[4], reply[5] + 1);
+        }
+        targets_release(targets, n, mgr);
         return 0;
     }
 
-    printf("Switching to channel %d ...\n", channel);
+    const int channel = FIXED_CHANNEL;
+    printf("Switching %d device%s to channel %d ...\n",
+           n, n == 1 ? "" : "s", channel);
     uint8_t host = (uint8_t)(channel - 1);
-    hidpp_call(t.dev, t.report_id, t.dev_idx, t.feature_idx, 1, &host, 1, NULL, 0);
-    target_release(&t);
+    int switched = 0;
+    for (int i = 0; i < n; i++) {
+        target_t *t = &targets[i];
+        printf("  %s\n", t->name);
+        /* setCurrentHost never replies; a successful SetReport is our signal. */
+        if (hidpp_call(t->dev, t->report_id, t->dev_idx, t->feature_idx, 1,
+                       &host, 1, NULL, 0))
+            switched++;
+    }
+    targets_release(targets, n, mgr);
+
+    if (switched == 0) {
+        fprintf(stderr, "No device accepted the channel switch.\n");
+        return 1;
+    }
+
+    if (!switch_display_usbc())
+        return 1;
     return 0;
 }

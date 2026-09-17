@@ -1,0 +1,10 @@
+{
+  "host": "0.0.0.0",
+  "port": 55778,
+  "betterdisplay_base": "http://127.0.0.1:55777",
+  "mxswitch_path": "../mxswitch",
+  "targets": {
+    "mac": { "ddc_alt": 144, "channel": 2 },
+    "windows": { "ddc_alt": 465, "channel": 1 }
+  }
+}

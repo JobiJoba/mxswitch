@@ -2,37 +2,29 @@
 #SingleInstance Force
 
 ; ---------------------------------------------------------------------------
-; Edit these two lines.
-;   SCRIPT : full path to windows\mxswitch.ps1 (preferred) or python\mxswitch.py
-;   TARGET : the Easy-Switch channel the other machine is paired on (1-3)
+; Edit this path to windows\mxswitch.ps1 (preferred) or python\mxswitch.py.
+; The PowerShell build always switches to channel 2; -Channel is ignored.
 ; ---------------------------------------------------------------------------
 SCRIPT := "C:\Path\To\mxswitch\windows\mxswitch.ps1"
-TARGET := 2
 
-SwitchChannel(channel) {
+SwitchAway() {
     global SCRIPT
-    ; PowerShell script: pass -Channel. Python script: pass the bare number.
     if (StrLower(SubStr(SCRIPT, -4)) = ".ps1") {
         Run(Format(
-            'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{1}" -Channel {2}',
-            SCRIPT, channel), , "Hide")
+            'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{1}"',
+            SCRIPT), , "Hide")
     } else {
-        ; Use pythonw.exe so no console window flashes.
-        Run(Format('pythonw.exe "{1}" {2}', SCRIPT, channel), , "Hide")
+        ; Python port still needs an explicit channel (2 = Mac on this setup).
+        Run(Format('pythonw.exe "{1}" 2', SCRIPT), , "Hide")
     }
 }
 
-; Ctrl+Alt+M  ->  hand the mouse over to the other machine
-^!m::SwitchChannel(TARGET)
+; Ctrl+Alt+M  ->  hand devices over to the other machine
+^!m::SwitchAway()
 
-; Ctrl+Alt+Shift+M  ->  hand it over and lock this machine behind you
+; Ctrl+Alt+Shift+M  ->  hand them over and lock this machine behind you
 ^!+m:: {
-    SwitchChannel(TARGET)
+    SwitchAway()
     Sleep 500                                ; let the frame go out first
     DllCall("user32\LockWorkStation")
 }
-
-; Explicit channels, in case you ever pair a third host
-^!1::SwitchChannel(1)
-^!2::SwitchChannel(2)
-^!3::SwitchChannel(3)

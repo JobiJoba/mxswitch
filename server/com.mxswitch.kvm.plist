@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template — edit the absolute paths below, then:
+
+    cp server/com.mxswitch.kvm.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.mxswitch.kvm.plist
+
+  Unload:
+
+    launchctl unload ~/Library/LaunchAgents/com.mxswitch.kvm.plist
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.mxswitch.kvm</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/python3</string>
+		<string>/ABS/PATH/TO/mxswitch/server/kvm_server.py</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/ABS/PATH/TO/mxswitch/server</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>KVM_CONFIG</key>
+		<string>/ABS/PATH/TO/mxswitch/server/config.json</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/tmp/mxswitch-kvm.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/mxswitch-kvm.err</string>
+</dict>
+</plist>

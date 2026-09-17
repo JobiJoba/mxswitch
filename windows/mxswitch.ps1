@@ -1,24 +1,27 @@
 <#
 .SYNOPSIS
-    Switch a Logitech Easy-Switch device to another channel via HID++ ChangeHost.
+    Switch Logitech Easy-Switch devices to another channel via HID++ ChangeHost.
 
 .DESCRIPTION
     No modules, no Python, no admin rights. P/Invokes hid.dll and setupapi.dll,
-    which ship with Windows.
+    which ship with Windows. Switches every ChangeHost-capable device on this
+    host (keyboard and mouse) to channel 2, then asks BetterDisplay on the Mac
+    to select the HDMI input. -Channel is accepted for older callers but ignored.
 
 .EXAMPLE
     .\mxswitch.ps1 -List
     .\mxswitch.ps1 -Info
-    .\mxswitch.ps1 -Channel 2
+    .\mxswitch.ps1
 
 .NOTES
     If the execution policy blocks this:
-        powershell -ExecutionPolicy Bypass -File .\mxswitch.ps1 -Channel 2
+        powershell -ExecutionPolicy Bypass -File .\mxswitch.ps1
     Add-Type will not work under Constrained Language Mode; check with
         $ExecutionContext.SessionState.LanguageMode
 #>
 [CmdletBinding(DefaultParameterSetName = 'Switch')]
 param(
+    # Accepted for compatibility with older hotkeys; this build always uses 2.
     [Parameter(ParameterSetName = 'Switch', Position = 0)]
     [ValidateRange(1, 3)]
     [int]$Channel,
@@ -33,6 +36,9 @@ param(
     [switch]$NoCache
 )
 
+$FixedChannel = 2
+# BetterDisplay on the Mac (HDMI = Mac input). Must be reachable from this PC.
+$BetterDisplayUrl = 'http://192.168.129.25:55777/set?ddcAlt=144&vcp=inputSelectAlt'
 $ErrorActionPreference = 'Stop'
 
 Add-Type -TypeDefinition @'
@@ -223,12 +229,12 @@ function Invoke-HidppCall {
 
 <#
     Discovery costs a round trip per candidate collection and device index, so
-    the resolved answer is cached. This is purely a latency win: a cached path
-    for a device that has since gone to sleep will not open, and we fall back to
-    a full scan. The cache is validated on every use rather than trusted, so a
-    firmware update that moves the feature index self-corrects.
+    resolved answers are cached (all ChangeHost devices). Cached paths that no
+    longer open are skipped and a full scan still runs so a newly connected
+    keyboard or mouse is found. Entries are validated on use; a firmware update
+    that moves the feature index self-corrects on the next successful probe.
 #>
-$CacheFile = Join-Path $env:LOCALAPPDATA 'mxswitch\device.json'
+$CacheFile = Join-Path $env:LOCALAPPDATA 'mxswitch\devices.json'
 
 function Get-DeviceRank {
     param([int]$UsagePage, [int]$Usage, [string]$Product)
@@ -242,88 +248,141 @@ function Get-DeviceRank {
     return (10 * $tier + $nonVendor)
 }
 
-function Test-KeyboardProduct {
-    param([string]$Product)
-    $n = "$Product".ToLowerInvariant()
-    $mouse = $n -match 'master|anywhere|mouse|ergo'
-    $kbd = $n -match 'keys|keyboard'
-    return [bool]($kbd -and -not $mouse)
+# Sibling HID collections of one physical device share Product + Pid.
+function Get-DeviceIdentity {
+    param($Iface)
+    return ('{0}|{1:x4}' -f $Iface.Product, $Iface.Pid)
 }
 
-function Get-CachedDevice {
-    if ($NoCache -or -not (Test-Path $CacheFile)) { return $null }
-    try { $c = Get-Content $CacheFile -Raw | ConvertFrom-Json } catch { return $null }
-
-    # Prefer a live mouse over a cached keyboard when both are present.
-    if (Test-KeyboardProduct $c.Product) { return $null }
-
+function New-IfaceFromCache {
+    param($Entry)
     $iface = New-Object 'Hid+Iface'
-    $iface.Path = $c.Path; $iface.Product = $c.Product
-    $iface.UsagePage = $c.UsagePage; $iface.Usage = $c.Usage; $iface.Pid = $c.Pid
-    $iface.InLen = $c.InLen; $iface.OutLen = $c.OutLen
+    $iface.Path = $Entry.Path; $iface.Product = $Entry.Product
+    $iface.UsagePage = $Entry.UsagePage; $iface.Usage = $Entry.Usage
+    $iface.Pid = $Entry.Pid
+    $iface.InLen = $Entry.InLen; $iface.OutLen = $Entry.OutLen
+    return $iface
+}
 
+function Test-CachedEntry {
+    param($Entry)
+    $iface = New-IfaceFromCache $Entry
     try { $dev = New-Object Hid $iface } catch { return $null }
 
-    # Confirm the cached feature index still resolves to ChangeHost.
-    $r = Invoke-HidppCall $dev 0x11 $c.DevIdx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250
-    if (-not $r) { $r = Invoke-HidppCall $dev 0x10 $c.DevIdx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250 }
-    if ($r -and $r[4] -eq $c.FeatureIdx -and $r[4] -ne 0) {
-        Write-Verbose 'using cached device'
-        return [pscustomobject]@{ Dev = $dev; ReportId = $c.ReportId; DevIdx = $c.DevIdx
-                                  FeatureIdx = $c.FeatureIdx; Iface = $iface }
+    $r = Invoke-HidppCall $dev 0x11 $Entry.DevIdx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250
+    if (-not $r) {
+        $r = Invoke-HidppCall $dev 0x10 $Entry.DevIdx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250
+    }
+    if ($r -and $r[4] -eq $Entry.FeatureIdx -and $r[4] -ne 0) {
+        Write-Verbose ("using cached device: {0}" -f $iface.Product)
+        return [pscustomobject]@{
+            Dev = $dev; ReportId = $Entry.ReportId; DevIdx = $Entry.DevIdx
+            FeatureIdx = $Entry.FeatureIdx; Iface = $iface
+        }
     }
     $dev.Close()
     return $null
 }
 
-function Save-CachedDevice {
-    param($Ctx)
+function Get-CachedEntries {
+    if ($NoCache -or -not (Test-Path $CacheFile)) { return @() }
+    try {
+        $raw = Get-Content $CacheFile -Raw | ConvertFrom-Json
+    } catch {
+        return @()
+    }
+    # v2 = array of devices. Ignore legacy single-object cache.
+    if ($null -eq $raw) { return @() }
+    if ($raw -is [System.Array]) { return @($raw) }
+    if ($raw.PSObject.Properties.Name -contains 'Devices') { return @($raw.Devices) }
+    return @()
+}
+
+function Save-CachedDevices {
+    param($Contexts)
     if ($NoCache) { return }
     try {
         $dir = Split-Path $CacheFile -Parent
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        [pscustomobject]@{
-            Path = $Ctx.Iface.Path; Product = $Ctx.Iface.Product
-            UsagePage = $Ctx.Iface.UsagePage; Usage = $Ctx.Iface.Usage
-            Pid = $Ctx.Iface.Pid; InLen = $Ctx.Iface.InLen; OutLen = $Ctx.Iface.OutLen
-            DevIdx = $Ctx.DevIdx; ReportId = $Ctx.ReportId; FeatureIdx = $Ctx.FeatureIdx
-        } | ConvertTo-Json | Set-Content $CacheFile
-    } catch { Write-Verbose 'could not write cache' }
+        $entries = @(foreach ($ctx in $Contexts) {
+            [pscustomobject]@{
+                Path = $ctx.Iface.Path; Product = $ctx.Iface.Product
+                UsagePage = $ctx.Iface.UsagePage; Usage = $ctx.Iface.Usage
+                Pid = $ctx.Iface.Pid; InLen = $ctx.Iface.InLen; OutLen = $ctx.Iface.OutLen
+                DevIdx = $ctx.DevIdx; ReportId = $ctx.ReportId; FeatureIdx = $ctx.FeatureIdx
+            }
+        })
+        [pscustomobject]@{ Version = 2; Devices = $entries } |
+            ConvertTo-Json | Set-Content $CacheFile
+    } catch {
+        Write-Verbose 'could not write cache'
+    }
 }
 
-function Find-MxDevice {
-    $cached = Get-CachedDevice
-    if ($cached) { return $cached }
+function Test-ChangeHostMatch {
+    param($Dev, $Iface)
+    $reportIds = @(0x11, 0x10) | Sort-Object `
+        @{ Expression = { if ($FRAME_LEN[[int]$_] -eq $Iface.OutLen) { 0 } else { 1 } } }
 
+    foreach ($didx in $DEVICE_INDICES) {
+        foreach ($rid in $reportIds) {
+            $r = Invoke-HidppCall $Dev $rid $didx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250
+            if ($r -and $r[4] -ne 0) {
+                return [pscustomobject]@{
+                    Dev = $Dev; ReportId = $rid; DevIdx = $didx
+                    FeatureIdx = $r[4]; Iface = $Iface
+                }
+            }
+        }
+    }
+    return $null
+}
+
+function Find-MxDevices {
+    $found = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+
+    foreach ($entry in Get-CachedEntries) {
+        $ctx = Test-CachedEntry $entry
+        if (-not $ctx) { continue }
+        $id = Get-DeviceIdentity $ctx.Iface
+        if ($seen.ContainsKey($id)) { $ctx.Dev.Close(); continue }
+        $seen[$id] = $true
+        $found.Add($ctx)
+    }
+
+    # Higher rank first: keyboards before mice (hotkey can still reach the keyboard).
     $ifaces = [Hid]::Enumerate($VID) |
-        Sort-Object { Get-DeviceRank $_.UsagePage $_.Usage $_.Product }
+        Sort-Object { Get-DeviceRank $_.UsagePage $_.Usage $_.Product } -Descending
 
     foreach ($iface in $ifaces) {
+        $id = Get-DeviceIdentity $iface
+        if ($seen.ContainsKey($id)) { continue }
+
         Write-Verbose ("probing {0:x4}:{1:x4} out={2} {3}" -f `
             $iface.UsagePage, $iface.Usage, $iface.OutLen, $iface.Product)
 
         try { $dev = New-Object Hid $iface } catch { continue }
 
-        # Try the report ID whose frame size matches this collection first; the
-        # other is attempted only in case one collection declares both.
-        $reportIds = @(0x11, 0x10) | Sort-Object `
-            @{ Expression = { if ($FRAME_LEN[[int]$_] -eq $iface.OutLen) { 0 } else { 1 } } }
-
-        foreach ($didx in $DEVICE_INDICES) {
-            foreach ($rid in $reportIds) {
-                $r = Invoke-HidppCall $dev $rid $didx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250
-                if ($r -and $r[4] -ne 0) {
-                    Write-Verbose ("matched index=0x{0:x2} report=0x{1:x2}" -f $didx, $rid)
-                    $ctx = [pscustomobject]@{ Dev = $dev; ReportId = $rid; DevIdx = $didx
-                                              FeatureIdx = $r[4]; Iface = $iface }
-                    Save-CachedDevice $ctx
-                    return $ctx
-                }
-            }
+        $ctx = Test-ChangeHostMatch $dev $iface
+        if ($ctx) {
+            Write-Verbose ("matched index=0x{0:x2} report=0x{1:x2} {2}" -f `
+                $ctx.DevIdx, $ctx.ReportId, $iface.Product)
+            $seen[$id] = $true
+            $found.Add($ctx)
+        } else {
+            $dev.Close()
         }
-        $dev.Close()
     }
-    return $null
+
+    if ($found.Count -gt 0) { Save-CachedDevices $found }
+
+    # Stable switch order: keyboards before mice, regardless of cache warmup order.
+    return @(
+        $found | Sort-Object {
+            - (Get-DeviceRank $_.Iface.UsagePage $_.Iface.Usage $_.Iface.Product)
+        }
+    )
 }
 
 if ($List) {
@@ -337,8 +396,8 @@ if ($List) {
     exit 0
 }
 
-$found = Find-MxDevice
-if (-not $found) {
+$devices = Find-MxDevices
+if (-not $devices -or $devices.Count -eq 0) {
     Write-Error ('No Logitech device supporting ChangeHost found. Click the mouse ' +
                  'to wake it, then retry. Run with -List to see what enumerated, ' +
                  'or -Verbose to watch the probe.')
@@ -346,20 +405,24 @@ if (-not $found) {
 }
 
 if ($Info) {
-    'device     : {0}' -f $found.Iface.Product
-    'collection : {0:x4}:{1:x4}  in={2} out={3}' -f `
-        $found.Iface.UsagePage, $found.Iface.Usage, $found.Iface.InLen, $found.Iface.OutLen
-    'transport  : {0}  index=0x{1:x2}  report=0x{2:x2}' -f `
-        $(if ($found.DevIdx -eq 0xFF) { 'direct (BT/USB)' } else { 'receiver' }), $found.DevIdx, $found.ReportId
-    'ChangeHost : feature index 0x{0:x2}' -f $found.FeatureIdx
-    $h = Invoke-HidppCall $found.Dev $found.ReportId $found.DevIdx $found.FeatureIdx 0
-    if ($h) { 'channels   : {0}, currently on {1}' -f $h[4], ($h[5] + 1) }
-    else    { 'channels   : (no reply to getHostInfo)' }
-    $found.Dev.Close()
+    $first = $true
+    foreach ($found in $devices) {
+        if (-not $first) { '' }
+        $first = $false
+        'device     : {0}' -f $found.Iface.Product
+        'collection : {0:x4}:{1:x4}  in={2} out={3}' -f `
+            $found.Iface.UsagePage, $found.Iface.Usage, $found.Iface.InLen, $found.Iface.OutLen
+        'transport  : {0}  index=0x{1:x2}  report=0x{2:x2}' -f `
+            $(if ($found.DevIdx -eq 0xFF) { 'direct (BT/USB)' } else { 'receiver' }), `
+            $found.DevIdx, $found.ReportId
+        'ChangeHost : feature index 0x{0:x2}' -f $found.FeatureIdx
+        $h = Invoke-HidppCall $found.Dev $found.ReportId $found.DevIdx $found.FeatureIdx 0
+        if ($h) { 'channels   : {0}, currently on {1}' -f $h[4], ($h[5] + 1) }
+        else    { 'channels   : (no reply to getHostInfo)' }
+        $found.Dev.Close()
+    }
     exit 0
 }
-
-if (-not $Channel) { Write-Error 'Give -Channel 1..3 or -Info'; exit 2 }
 
 <#
     setCurrentHost never replies - the link is torn down as part of executing it.
@@ -379,7 +442,7 @@ function Invoke-Switch {
     $frame[3] = (1 -shl 4) -bor $SW_ID; $frame[4] = $TargetChannel - 1
 
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        Write-Verbose "switch attempt $attempt"
+        Write-Verbose ("switch attempt {0} ({1})" -f $attempt, $Ctx.Iface.Product)
         if ($Ctx.Dev.Write($frame)) {
             Start-Sleep -Milliseconds 250
             $still = Invoke-HidppCall $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx `
@@ -392,12 +455,28 @@ function Invoke-Switch {
     return $false
 }
 
-"Switching to channel $Channel ..."
-$ok = Invoke-Switch $found $Channel
-$found.Dev.Close()
-if (-not $ok) {
-    Write-Error ('The device did not leave this host. It may be asleep, or the ' +
-                 'target channel may be unpaired. Click the mouse and retry.')
+$n = $devices.Count
+"Switching $n device$(if ($n -eq 1) { '' } else { 's' }) to channel $FixedChannel ..."
+$okCount = 0
+foreach ($found in $devices) {
+    "  $($found.Iface.Product)"
+    if (Invoke-Switch $found $FixedChannel) { $okCount++ }
+    else {
+        Write-Warning ("{0} did not leave this host." -f $found.Iface.Product)
+    }
+    $found.Dev.Close()
+}
+if ($okCount -eq 0) {
+    Write-Error ('No device left this host. They may be asleep, or the target ' +
+                 'channel may be unpaired. Click a device and retry.')
+    exit 1
+}
+
+try {
+    $null = Invoke-WebRequest -UseBasicParsing -Uri $BetterDisplayUrl -TimeoutSec 5
+    "display    : HDMI (Mac) via $BetterDisplayUrl"
+} catch {
+    Write-Warning ("BetterDisplay switch failed: {0}" -f $_.Exception.Message)
     exit 1
 }
 exit 0
