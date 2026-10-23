@@ -4,7 +4,7 @@
  *
  * Switches every ChangeHost-capable device on this host (keyboard and mouse)
  * to channel 1 (this Mac build is fixed to hand devices to that channel).
- * On success it also asks BetterDisplay to select the USB-C input (Windows).
+ * On success it also asks BetterDisplay to select the HDMI input (Windows).
  *
  * Build:
  *     clang -O2 -Wall -o mxswitch mxswitch.c \
@@ -12,7 +12,7 @@
  *     codesign -s - mxswitch          # ad-hoc sign: keeps the TCC grant stable
  *
  * Usage:
- *     ./mxswitch              # switch all devices to channel 1 + USB-C display
+ *     ./mxswitch              # switch all devices to channel 1 + HDMI display
  *     ./mxswitch --info
  *     ./mxswitch --setup      # open Input Monitoring settings if needed
  *
@@ -38,9 +38,9 @@
 #define FEAT_CHANGE_HOST  0x1814
 #define FIXED_CHANNEL     1     /* this Mac build always switches to channel 1 */
 
-/* BetterDisplay HTTP API: USB-C / Windows input (ddcAlt from server/config.json). */
-#define BETTERDISPLAY_USBC_URL \
-    "http://127.0.0.1:55777/set?ddcAlt=465&vcp=inputSelectAlt"
+/* BetterDisplay HTTP API: HDMI / Windows input (ddcAlt from server/config.json). */
+#define BETTERDISPLAY_HDMI_URL \
+    "http://127.0.0.1:55777/set?ddcAlt=144&vcp=inputSelectAlt"
 
 #define REPORT_SHORT 0x10
 #define REPORT_LONG  0x11
@@ -419,19 +419,19 @@ static int setup_input_monitoring(void) {
     return 0;
 }
 
-/* Ask BetterDisplay to select the USB-C (Windows) input. Returns 1 on success. */
-static int switch_display_usbc(void) {
+/* Ask BetterDisplay to select the HDMI (Windows) input. Returns 1 on success. */
+static int switch_display_hdmi(void) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
              "/usr/bin/curl -fsS --max-time 5 '%s' >/dev/null",
-             BETTERDISPLAY_USBC_URL);
+             BETTERDISPLAY_HDMI_URL);
     int rc = system(cmd);
     if (rc != 0) {
-        fprintf(stderr, "BetterDisplay USB-C switch failed (is BetterDisplay "
+        fprintf(stderr, "BetterDisplay HDMI switch failed (is BetterDisplay "
                         "running with HTTP on :55777?)\n");
         return 0;
     }
-    printf("display    : USB-C (Windows)\n");
+    printf("display    : HDMI (Windows)\n");
     return 1;
 }
 
@@ -510,7 +510,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (!switch_display_usbc())
+    if (!switch_display_hdmi())
         return 1;
     return 0;
 }

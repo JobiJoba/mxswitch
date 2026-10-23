@@ -5,8 +5,8 @@ KVM orchestration server for Mac.
 Switches the LG monitor via BetterDisplay's HTTP API and Logitech Easy-Switch
 devices via the local mxswitch binary.
 
-  GET /mac      -> HDMI (ddcAlt) + Logitech channel for Mac
-  GET /windows  -> USB-C (ddcAlt) + Logitech channel for Windows
+  GET /mac      -> USB-C (ddcAlt) + Logitech channel for Mac
+  GET /windows  -> HDMI (ddcAlt) + Logitech channel for Windows
   GET /health   -> liveness
 """
 

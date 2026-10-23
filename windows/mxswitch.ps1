@@ -6,7 +6,7 @@
     No modules, no Python, no admin rights. P/Invokes hid.dll and setupapi.dll,
     which ship with Windows. Switches every ChangeHost-capable device on this
     host (keyboard and mouse) to channel 2, then asks BetterDisplay on the Mac
-    to select the HDMI input. -Channel is accepted for older callers but ignored.
+    to select the USB-C input. -Channel is accepted for older callers but ignored.
 
 .EXAMPLE
     .\mxswitch.ps1 -List
@@ -37,8 +37,8 @@ param(
 )
 
 $FixedChannel = 2
-# BetterDisplay on the Mac (HDMI = Mac input). Must be reachable from this PC.
-$BetterDisplayUrl = 'http://192.168.129.25:55777/set?ddcAlt=144&vcp=inputSelectAlt'
+# BetterDisplay on the Mac (USB-C = Mac input). Must be reachable from this PC.
+$BetterDisplayUrl = 'http://192.168.129.25:55777/set?ddcAlt=465&vcp=inputSelectAlt'
 $ErrorActionPreference = 'Stop'
 
 Add-Type -TypeDefinition @'
@@ -525,7 +525,7 @@ if ($okCount -eq 0) {
 
 try {
     $null = Invoke-WebRequest -UseBasicParsing -Uri $BetterDisplayUrl -TimeoutSec 5
-    "display    : HDMI (Mac) via $BetterDisplayUrl"
+    "display    : USB-C (Mac) via $BetterDisplayUrl"
 } catch {
     Write-Warning ("BetterDisplay switch failed: {0}" -f $_.Exception.Message)
     exit 1

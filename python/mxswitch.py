@@ -8,7 +8,7 @@ Switches every ChangeHost-capable device on this host (keyboard and mouse).
 On Windows this needs nothing but a Python 3 interpreter: the HID plumbing goes
 straight through hid.dll and setupapi.dll via ctypes. No admin rights. This
 Windows build always targets channel 2, then asks BetterDisplay on the Mac to
-select the HDMI input.
+select the USB-C input.
 
 On macOS/Linux it falls back to hidapi (pip install hidapi).
 
@@ -42,7 +42,7 @@ DEVICE_INDICES = (0xFF, 1, 2, 3, 4, 5, 6)
 # Windows KVM defaults (same as windows/mxswitch.ps1).
 FIXED_CHANNEL_WIN = 2
 BETTERDISPLAY_URL = (
-    "http://192.168.129.25:55777/set?ddcAlt=144&vcp=inputSelectAlt"
+    "http://192.168.129.25:55777/set?ddcAlt=465&vcp=inputSelectAlt"
 )
 
 # Bluetooth PIDs when the product string is unhelpful.
@@ -385,8 +385,8 @@ def set_host(dev, dev_idx, report_id, feat_idx, host_0based):
     return bool(dev.write(frame.ljust(FRAME_LEN[report_id], b"\x00")))
 
 
-def switch_display_hdmi():
-    """Ask BetterDisplay on the Mac to select HDMI (Mac input)."""
+def switch_display_usbc():
+    """Ask BetterDisplay on the Mac to select USB-C (Mac input)."""
     try:
         with urllib.request.urlopen(BETTERDISPLAY_URL, timeout=5) as resp:
             ok = 200 <= getattr(resp, "status", 200) < 300
@@ -396,7 +396,7 @@ def switch_display_hdmi():
     if not ok:
         print("BetterDisplay switch failed (bad HTTP status).", file=sys.stderr)
         return False
-    print(f"display    : HDMI (Mac) via {BETTERDISPLAY_URL}")
+    print(f"display    : USB-C (Mac) via {BETTERDISPLAY_URL}")
     return True
 
 
@@ -475,7 +475,7 @@ def main():
         print("No device accepted the channel switch.", file=sys.stderr)
         return 1
 
-    if is_win and not switch_display_hdmi():
+    if is_win and not switch_display_usbc():
         return 1
     return 0
 

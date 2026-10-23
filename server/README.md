@@ -8,8 +8,8 @@ Windows only needs `curl`. No Logitech software on Windows.
 
 | Endpoint       | Monitor (BetterDisplay `:55777`) | Logitech |
 | -------------- | -------------------------------- | -------- |
-| `GET /mac`     | HDMI — `ddcAlt=144`              | channel 2 |
-| `GET /windows` | USB-C — `ddcAlt=465`             | channel 1 |
+| `GET /mac`     | USB-C — `ddcAlt=465`             | channel 2 |
+| `GET /windows` | HDMI — `ddcAlt=144`              | channel 1 |
 | `GET /health`  | —                                | —         |
 
 Edit [`config.json`](config.json) to change ports, `ddcAlt` codes, or channels.
@@ -57,5 +57,5 @@ Logs: `/tmp/mxswitch-kvm.log` and `/tmp/mxswitch-kvm.err`.
 
 `mxswitch` can only ChangeHost while the keyboard/mouse are connected to the Mac.
 
-- `/windows` works when devices are on the Mac (display → USB-C, then leave to channel 1).
-- `/mac` always switches the monitor to HDMI; Logitech returns to channel 2 only if the devices are still visible to the Mac. If they are already on Windows, use the Easy-Switch button once (or switch before leaving).
+- `/windows` works when devices are on the Mac (display → HDMI, then leave to channel 1).
+- `/mac` always switches the monitor to USB-C; Logitech returns to channel 2 only if the devices are still visible to the Mac. If they are already on Windows, use the Easy-Switch button once (or switch before leaving).
